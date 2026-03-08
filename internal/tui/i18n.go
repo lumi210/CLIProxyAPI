@@ -162,6 +162,7 @@ var zhStrings = map[string]string{
 	"edit_key_prompt":    "  Edit Key: ",
 	"enter_add":          "    Enter: 添加 • Esc: 取消",
 	"enter_save_esc":     "    Enter: 保存 • Esc: 取消",
+	"key_entry_hint":     "    格式: key | expires-at=2026-03-31T23:59:59Z | token-limit=100000",
 
 	// ── OAuth ──
 	"oauth_title":        "🔐 OAuth 登录",
@@ -313,6 +314,7 @@ var enStrings = map[string]string{
 	"edit_key_prompt":    "  Edit Key: ",
 	"enter_add":          "    Enter: Add • Esc: Cancel",
 	"enter_save_esc":     "    Enter: Save • Esc: Cancel",
+	"key_entry_hint":     "    Format: key | expires-at=2026-03-31T23:59:59Z | token-limit=100000",
 
 	// ── OAuth ──
 	"oauth_title":        "🔐 OAuth Login",

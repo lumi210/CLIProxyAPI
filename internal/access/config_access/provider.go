@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
@@ -16,31 +18,42 @@ func Register(cfg *sdkconfig.SDKConfig) {
 		return
 	}
 
-	keys := normalizeKeys(cfg.APIKeys)
-	if len(keys) == 0 {
+	entries := normalizeAPIKeyEntries(cfg.APIKeyEntries, cfg.APIKeys)
+	if len(entries) == 0 {
 		sdkaccess.UnregisterProvider(sdkaccess.AccessProviderTypeConfigAPIKey)
 		return
 	}
 
 	sdkaccess.RegisterProvider(
 		sdkaccess.AccessProviderTypeConfigAPIKey,
-		newProvider(sdkaccess.DefaultAccessProviderName, keys),
+		newProvider(sdkaccess.DefaultAccessProviderName, entries),
 	)
 }
 
 type provider struct {
 	name string
-	keys map[string]struct{}
+	keys map[string]apiKeyPolicy
 }
 
-func newProvider(name string, keys []string) *provider {
+type apiKeyPolicy struct {
+	expiresAt  time.Time
+	tokenLimit int64
+}
+
+func newProvider(name string, entries []sdkconfig.APIKeyEntry) *provider {
 	providerName := strings.TrimSpace(name)
 	if providerName == "" {
 		providerName = sdkaccess.DefaultAccessProviderName
 	}
-	keySet := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		keySet[key] = struct{}{}
+	keySet := make(map[string]apiKeyPolicy, len(entries))
+	for _, entry := range entries {
+		policy := apiKeyPolicy{tokenLimit: entry.TokenLimit}
+		if entry.ExpiresAt != "" {
+			if parsed, err := time.Parse(time.RFC3339, entry.ExpiresAt); err == nil {
+				policy.expiresAt = parsed
+			}
+		}
+		keySet[entry.APIKey] = policy
 	}
 	return &provider{name: providerName, keys: keySet}
 }
@@ -89,7 +102,21 @@ func (p *provider) Authenticate(_ context.Context, r *http.Request) (*sdkaccess.
 		if candidate.value == "" {
 			continue
 		}
-		if _, ok := p.keys[candidate.value]; ok {
+		policy, ok := p.keys[candidate.value]
+		if !ok {
+			continue
+		}
+		if !policy.expiresAt.IsZero() && !policy.expiresAt.After(time.Now()) {
+			return nil, sdkaccess.NewInvalidCredentialError()
+		}
+		if policy.tokenLimit > 0 {
+			stats := usage.GetRequestStatistics().Snapshot()
+			apiStats, exists := stats.APIs[candidate.value]
+			if exists && apiStats.TotalTokens >= policy.tokenLimit {
+				return nil, sdkaccess.NewInvalidCredentialError()
+			}
+		}
+		{
 			return &sdkaccess.Result{
 				Provider:  p.Identifier(),
 				Principal: candidate.value,
@@ -133,6 +160,38 @@ func normalizeKeys(keys []string) []string {
 		}
 		seen[trimmedKey] = struct{}{}
 		normalized = append(normalized, trimmedKey)
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func normalizeAPIKeyEntries(entries []sdkconfig.APIKeyEntry, fallback []string) []sdkconfig.APIKeyEntry {
+	seen := make(map[string]struct{}, len(entries)+len(fallback))
+	normalized := make([]sdkconfig.APIKeyEntry, 0, len(entries)+len(fallback))
+	for _, entry := range entries {
+		key := strings.TrimSpace(entry.APIKey)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		entry.APIKey = key
+		entry.ExpiresAt = strings.TrimSpace(entry.ExpiresAt)
+		if entry.TokenLimit < 0 {
+			entry.TokenLimit = 0
+		}
+		normalized = append(normalized, entry)
+	}
+	for _, key := range normalizeKeys(fallback) {
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, sdkconfig.APIKeyEntry{APIKey: key})
 	}
 	if len(normalized) == 0 {
 		return nil

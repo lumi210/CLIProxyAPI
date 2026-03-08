@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/atotto/clipboard"
@@ -15,7 +16,7 @@ import (
 type keysTabModel struct {
 	client   *Client
 	viewport viewport.Model
-	keys     []string
+	keys     []accessAPIKeyEntry
 	gemini   []map[string]any
 	claude   []map[string]any
 	codex    []map[string]any
@@ -37,7 +38,7 @@ type keysTabModel struct {
 }
 
 type keysDataMsg struct {
-	apiKeys []string
+	apiKeys []accessAPIKeyEntry
 	gemini  []map[string]any
 	claude  []map[string]any
 	codex   []map[string]any
@@ -120,8 +121,8 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		if m.editing || m.adding {
 			switch msg.String() {
 			case "enter":
-				value := strings.TrimSpace(m.editInput.Value())
-				if value == "" {
+				entry, ok := m.currentEditEntry()
+				if !ok {
 					m.editing = false
 					m.adding = false
 					m.editInput.Blur()
@@ -135,7 +136,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 				m.editInput.Blur()
 				if isAdding {
 					return m, func() tea.Msg {
-						err := m.client.AddAPIKey(value)
+						err := m.client.AddAPIKey(entry)
 						if err != nil {
 							return keyActionMsg{err: err}
 						}
@@ -143,7 +144,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 					}
 				}
 				return m, func() tea.Msg {
-					err := m.client.EditAPIKey(editIdx, value)
+					err := m.client.EditAPIKey(editIdx, entry)
 					if err != nil {
 						return keyActionMsg{err: err}
 					}
@@ -202,7 +203,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			// Add new key
 			m.adding = true
 			m.editing = false
-			m.editInput.SetValue("")
+			m.setEditInput(accessAPIKeyEntry{})
 			m.editInput.Prompt = T("new_key_prompt")
 			m.editInput.Focus()
 			m.viewport.SetContent(m.renderContent())
@@ -213,7 +214,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 				m.editing = true
 				m.adding = false
 				m.editIdx = m.cursor
-				m.editInput.SetValue(m.keys[m.cursor])
+				m.setEditInput(m.keys[m.cursor])
 				m.editInput.Prompt = T("edit_key_prompt")
 				m.editInput.Focus()
 				m.viewport.SetContent(m.renderContent())
@@ -230,7 +231,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		case "c":
 			// Copy selected key to clipboard
 			if m.cursor < len(m.keys) {
-				key := m.keys[m.cursor]
+				key := m.keys[m.cursor].APIKey
 				if err := clipboard.WriteAll(key); err != nil {
 					m.status = errorStyle.Render(T("copy_failed") + ": " + err.Error())
 				} else {
@@ -308,13 +309,13 @@ func (m keysTabModel) renderContent() string {
 			rowStyle = lipgloss.NewStyle().Bold(true)
 		}
 
-		row := fmt.Sprintf("%s%d. %s", cursor, i+1, maskKey(key))
+		row := fmt.Sprintf("%s%d. %s", cursor, i+1, formatAccessKeyEntry(key))
 		sb.WriteString(rowStyle.Render(row))
 		sb.WriteString("\n")
 
 		// Delete confirmation
 		if m.confirm == i {
-			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(key))))
+			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(key.APIKey))))
 			sb.WriteString("\n")
 		}
 
@@ -323,6 +324,8 @@ func (m keysTabModel) renderContent() string {
 			sb.WriteString(m.editInput.View())
 			sb.WriteString("\n")
 			sb.WriteString(helpStyle.Render(T("enter_save_esc")))
+			sb.WriteString("\n")
+			sb.WriteString(helpStyle.Render(T("key_entry_hint")))
 			sb.WriteString("\n")
 		}
 	}
@@ -333,6 +336,8 @@ func (m keysTabModel) renderContent() string {
 		sb.WriteString(m.editInput.View())
 		sb.WriteString("\n")
 		sb.WriteString(helpStyle.Render(T("enter_add")))
+		sb.WriteString("\n")
+		sb.WriteString(helpStyle.Render(T("key_entry_hint")))
 		sb.WriteString("\n")
 	}
 
@@ -402,4 +407,64 @@ func maskKey(key string) string {
 		return strings.Repeat("*", len(key))
 	}
 	return key[:4] + strings.Repeat("*", len(key)-8) + key[len(key)-4:]
+}
+
+func (m *keysTabModel) setEditInput(entry accessAPIKeyEntry) {
+	parts := []string{entry.APIKey}
+	if entry.ExpiresAt != "" {
+		parts = append(parts, "expires-at="+entry.ExpiresAt)
+	}
+	if entry.TokenLimit > 0 {
+		parts = append(parts, fmt.Sprintf("token-limit=%d", entry.TokenLimit))
+	}
+	m.editInput.SetValue(strings.Join(parts, " | "))
+}
+
+func (m keysTabModel) currentEditEntry() (accessAPIKeyEntry, bool) {
+	parts := strings.Split(m.editInput.Value(), "|")
+	entry := accessAPIKeyEntry{}
+	if len(parts) == 0 {
+		return entry, false
+	}
+	entry.APIKey = strings.TrimSpace(parts[0])
+	if entry.APIKey == "" {
+		return entry, false
+	}
+	for _, rawPart := range parts[1:] {
+		part := strings.TrimSpace(rawPart)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		value := strings.TrimSpace(kv[1])
+		switch key {
+		case "expires-at":
+			entry.ExpiresAt = value
+		case "token-limit":
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err == nil && parsed > 0 {
+				entry.TokenLimit = parsed
+			}
+		}
+	}
+	return entry, true
+}
+
+func formatAccessKeyEntry(entry accessAPIKeyEntry) string {
+	info := maskKey(entry.APIKey)
+	meta := make([]string, 0, 2)
+	if entry.ExpiresAt != "" {
+		meta = append(meta, "expires-at: "+entry.ExpiresAt)
+	}
+	if entry.TokenLimit > 0 {
+		meta = append(meta, fmt.Sprintf("token-limit: %d", entry.TokenLimit))
+	}
+	if len(meta) == 0 {
+		return info
+	}
+	return info + " (" + strings.Join(meta, ", ") + ")"
 }

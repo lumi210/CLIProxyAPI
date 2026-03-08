@@ -11,6 +11,12 @@ import (
 	"time"
 )
 
+type accessAPIKeyEntry struct {
+	APIKey     string `json:"api-key"`
+	ExpiresAt  string `json:"expires-at,omitempty"`
+	TokenLimit int64  `json:"token-limit,omitempty"`
+}
+
 // Client wraps HTTP calls to the management API.
 type Client struct {
 	baseURL   string
@@ -240,38 +246,53 @@ func (c *Client) GetLogs(after int64, limit int) ([]string, int64, error) {
 }
 
 // GetAPIKeys fetches the list of API keys.
-// API returns {"api-keys": [...]}.
-func (c *Client) GetAPIKeys() ([]string, error) {
+// API returns {"api-keys": [...], "api-key-entries": [...]}.
+func (c *Client) GetAPIKeys() ([]accessAPIKeyEntry, error) {
 	wrapper, err := c.getJSON("/v0/management/api-keys")
 	if err != nil {
 		return nil, err
 	}
+	if arr, ok := wrapper["api-key-entries"]; ok && arr != nil {
+		raw, err := json.Marshal(arr)
+		if err != nil {
+			return nil, err
+		}
+		var result []accessAPIKeyEntry
+		if err := json.Unmarshal(raw, &result); err != nil {
+			return nil, err
+		}
+		return result, nil
+	}
 	arr, ok := wrapper["api-keys"]
-	if !ok {
+	if !ok || arr == nil {
 		return nil, nil
 	}
 	raw, err := json.Marshal(arr)
 	if err != nil {
 		return nil, err
 	}
-	var result []string
-	if err := json.Unmarshal(raw, &result); err != nil {
+	var keys []string
+	if err := json.Unmarshal(raw, &keys); err != nil {
 		return nil, err
+	}
+	result := make([]accessAPIKeyEntry, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, accessAPIKeyEntry{APIKey: key})
 	}
 	return result, nil
 }
 
-// AddAPIKey adds a new API key by sending old=nil, new=key which appends.
-func (c *Client) AddAPIKey(key string) error {
-	body := map[string]any{"old": nil, "new": key}
+// AddAPIKey adds a new API key entry.
+func (c *Client) AddAPIKey(entry accessAPIKeyEntry) error {
+	body := map[string]any{"value": entry}
 	jsonBody, _ := json.Marshal(body)
 	_, err := c.patch("/v0/management/api-keys", strings.NewReader(string(jsonBody)))
 	return err
 }
 
-// EditAPIKey replaces an API key at the given index.
-func (c *Client) EditAPIKey(index int, newValue string) error {
-	body := map[string]any{"index": index, "value": newValue}
+// EditAPIKey replaces an API key entry at the given index.
+func (c *Client) EditAPIKey(index int, entry accessAPIKeyEntry) error {
+	body := map[string]any{"index": index, "value": entry}
 	jsonBody, _ := json.Marshal(body)
 	_, err := c.patch("/v0/management/api-keys", strings.NewReader(string(jsonBody)))
 	return err
