@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/bcrypt"
@@ -621,6 +622,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
 
+	// Sanitize inline access API key entries and sync legacy api-keys.
+	cfg.SanitizeAPIKeyEntries()
+
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
@@ -647,6 +651,76 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// SanitizeAPIKeyEntries normalizes structured inline API keys and keeps legacy api-keys in sync.
+func (cfg *Config) SanitizeAPIKeyEntries() {
+	if cfg == nil {
+		return
+	}
+
+	seen := make(map[string]struct{}, len(cfg.APIKeyEntries)+len(cfg.APIKeys))
+	entries := make([]APIKeyEntry, 0, len(cfg.APIKeyEntries)+len(cfg.APIKeys))
+	hasStructuredEntries := len(cfg.APIKeyEntries) > 0
+
+	for i := range cfg.APIKeyEntries {
+		entry, ok := normalizeAPIKeyEntry(cfg.APIKeyEntries[i])
+		if !ok {
+			continue
+		}
+		if _, exists := seen[entry.APIKey]; exists {
+			continue
+		}
+		seen[entry.APIKey] = struct{}{}
+		entries = append(entries, entry)
+	}
+
+	if !hasStructuredEntries {
+		for _, rawKey := range cfg.APIKeys {
+			key := strings.TrimSpace(rawKey)
+			if key == "" {
+				continue
+			}
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			entries = append(entries, APIKeyEntry{APIKey: key})
+		}
+	}
+
+	if len(entries) == 0 {
+		cfg.APIKeyEntries = nil
+		cfg.APIKeys = nil
+		return
+	}
+
+	cfg.APIKeyEntries = entries
+	keys := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		keys = append(keys, entry.APIKey)
+	}
+	cfg.APIKeys = keys
+}
+
+func normalizeAPIKeyEntry(entry APIKeyEntry) (APIKeyEntry, bool) {
+	entry.APIKey = strings.TrimSpace(entry.APIKey)
+	if entry.APIKey == "" {
+		return APIKeyEntry{}, false
+	}
+	entry.ExpiresAt = strings.TrimSpace(entry.ExpiresAt)
+	if entry.ExpiresAt != "" {
+		parsed, err := time.Parse(time.RFC3339, entry.ExpiresAt)
+		if err != nil {
+			entry.ExpiresAt = ""
+		} else {
+			entry.ExpiresAt = parsed.UTC().Format(time.RFC3339)
+		}
+	}
+	if entry.TokenLimit < 0 {
+		entry.TokenLimit = 0
+	}
+	return entry, true
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.

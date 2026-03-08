@@ -2,7 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -15,7 +17,7 @@ import (
 type keysTabModel struct {
 	client   *Client
 	viewport viewport.Model
-	keys     []string
+	keys     []accessAPIKeyEntry
 	gemini   []map[string]any
 	claude   []map[string]any
 	codex    []map[string]any
@@ -30,14 +32,16 @@ type keysTabModel struct {
 	status   string
 
 	// Editing / Adding
-	editing   bool
-	adding    bool
-	editIdx   int
-	editInput textinput.Model
+	editing      bool
+	adding       bool
+	editIdx      int
+	editField    int
+	editInputs   []textinput.Model
+	editingError string
 }
 
 type keysDataMsg struct {
-	apiKeys []string
+	apiKeys []accessAPIKeyEntry
 	gemini  []map[string]any
 	claude  []map[string]any
 	codex   []map[string]any
@@ -52,13 +56,18 @@ type keyActionMsg struct {
 }
 
 func newKeysTabModel(client *Client) keysTabModel {
-	ti := textinput.New()
-	ti.CharLimit = 512
-	ti.Prompt = "  Key: "
+	inputs := make([]textinput.Model, 3)
+	prompts := []string{"  Key: ", "  Expires At: ", "  Token Limit: "}
+	limits := []int{512, 64, 32}
+	for i := range inputs {
+		inputs[i] = textinput.New()
+		inputs[i].Prompt = prompts[i]
+		inputs[i].CharLimit = limits[i]
+	}
 	return keysTabModel{
-		client:    client,
-		confirm:   -1,
-		editInput: ti,
+		client:     client,
+		confirm:    -1,
+		editInputs: inputs,
 	}
 }
 
@@ -120,22 +129,23 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		if m.editing || m.adding {
 			switch msg.String() {
 			case "enter":
-				value := strings.TrimSpace(m.editInput.Value())
-				if value == "" {
-					m.editing = false
-					m.adding = false
-					m.editInput.Blur()
+				if m.editField < len(m.editInputs)-1 {
+					m.focusEditField(m.editField + 1)
+					m.viewport.SetContent(m.renderContent())
+					return m, textinput.Blink
+				}
+				entry, err := m.currentEditEntry()
+				if err != nil {
+					m.editingError = err.Error()
 					m.viewport.SetContent(m.renderContent())
 					return m, nil
 				}
 				isAdding := m.adding
 				editIdx := m.editIdx
-				m.editing = false
-				m.adding = false
-				m.editInput.Blur()
+				m.clearEditingState()
 				if isAdding {
 					return m, func() tea.Msg {
-						err := m.client.AddAPIKey(value)
+						err := m.client.AddAPIKey(entry)
 						if err != nil {
 							return keyActionMsg{err: err}
 						}
@@ -143,21 +153,35 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 					}
 				}
 				return m, func() tea.Msg {
-					err := m.client.EditAPIKey(editIdx, value)
+					err := m.client.EditAPIKey(editIdx, entry)
 					if err != nil {
 						return keyActionMsg{err: err}
 					}
 					return keyActionMsg{action: T("key_updated")}
 				}
 			case "esc":
-				m.editing = false
-				m.adding = false
-				m.editInput.Blur()
+				m.clearEditingState()
 				m.viewport.SetContent(m.renderContent())
 				return m, nil
+			case "tab", "shift+tab", "up", "down":
+				delta := 1
+				if msg.String() == "shift+tab" || msg.String() == "up" {
+					delta = -1
+				}
+				next := m.editField + delta
+				if next < 0 {
+					next = len(m.editInputs) - 1
+				}
+				if next >= len(m.editInputs) {
+					next = 0
+				}
+				m.focusEditField(next)
+				m.viewport.SetContent(m.renderContent())
+				return m, textinput.Blink
 			default:
 				var cmd tea.Cmd
-				m.editInput, cmd = m.editInput.Update(msg)
+				m.editInputs[m.editField], cmd = m.editInputs[m.editField].Update(msg)
+				m.editingError = ""
 				m.viewport.SetContent(m.renderContent())
 				return m, cmd
 			}
@@ -202,9 +226,8 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 			// Add new key
 			m.adding = true
 			m.editing = false
-			m.editInput.SetValue("")
-			m.editInput.Prompt = T("new_key_prompt")
-			m.editInput.Focus()
+			m.setEditInputs(accessAPIKeyEntry{})
+			m.focusEditField(0)
 			m.viewport.SetContent(m.renderContent())
 			return m, textinput.Blink
 		case "e":
@@ -213,9 +236,8 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 				m.editing = true
 				m.adding = false
 				m.editIdx = m.cursor
-				m.editInput.SetValue(m.keys[m.cursor])
-				m.editInput.Prompt = T("edit_key_prompt")
-				m.editInput.Focus()
+				m.setEditInputs(m.keys[m.cursor])
+				m.focusEditField(0)
 				m.viewport.SetContent(m.renderContent())
 				return m, textinput.Blink
 			}
@@ -230,7 +252,7 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 		case "c":
 			// Copy selected key to clipboard
 			if m.cursor < len(m.keys) {
-				key := m.keys[m.cursor]
+				key := m.keys[m.cursor].APIKey
 				if err := clipboard.WriteAll(key); err != nil {
 					m.status = errorStyle.Render(T("copy_failed") + ": " + err.Error())
 				} else {
@@ -257,7 +279,9 @@ func (m keysTabModel) Update(msg tea.Msg) (keysTabModel, tea.Cmd) {
 func (m *keysTabModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
-	m.editInput.Width = w - 16
+	for i := range m.editInputs {
+		m.editInputs[i].Width = max(20, w-20)
+	}
 	if !m.ready {
 		m.viewport = viewport.New(w, h)
 		m.viewport.SetContent(m.renderContent())
@@ -308,32 +332,26 @@ func (m keysTabModel) renderContent() string {
 			rowStyle = lipgloss.NewStyle().Bold(true)
 		}
 
-		row := fmt.Sprintf("%s%d. %s", cursor, i+1, maskKey(key))
+		row := fmt.Sprintf("%s%d. %s", cursor, i+1, formatAccessKeyEntry(key))
 		sb.WriteString(rowStyle.Render(row))
 		sb.WriteString("\n")
 
 		// Delete confirmation
 		if m.confirm == i {
-			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(key))))
+			sb.WriteString(warningStyle.Render(fmt.Sprintf("    "+T("confirm_delete_key"), maskKey(key.APIKey))))
 			sb.WriteString("\n")
 		}
 
 		// Edit input
 		if m.editing && m.editIdx == i {
-			sb.WriteString(m.editInput.View())
-			sb.WriteString("\n")
-			sb.WriteString(helpStyle.Render(T("enter_save_esc")))
-			sb.WriteString("\n")
+			m.renderEditForm(&sb)
 		}
 	}
 
 	// Add input
 	if m.adding {
 		sb.WriteString("\n")
-		sb.WriteString(m.editInput.View())
-		sb.WriteString("\n")
-		sb.WriteString(helpStyle.Render(T("enter_add")))
-		sb.WriteString("\n")
+		m.renderEditForm(&sb)
 	}
 
 	sb.WriteString("\n")
@@ -402,4 +420,104 @@ func maskKey(key string) string {
 		return strings.Repeat("*", len(key))
 	}
 	return key[:4] + strings.Repeat("*", len(key)-8) + key[len(key)-4:]
+}
+
+func (m *keysTabModel) setEditInputs(entry accessAPIKeyEntry) {
+	m.editInputs[0].SetValue(entry.APIKey)
+	m.editInputs[1].SetValue(entry.ExpiresAt)
+	if entry.TokenLimit > 0 {
+		m.editInputs[2].SetValue(strconv.FormatInt(entry.TokenLimit, 10))
+	} else {
+		m.editInputs[2].SetValue("")
+	}
+	m.editingError = ""
+}
+
+func (m keysTabModel) currentEditEntry() (accessAPIKeyEntry, error) {
+	entry := accessAPIKeyEntry{}
+	entry.APIKey = strings.TrimSpace(m.editInputs[0].Value())
+	if entry.APIKey == "" {
+		return entry, fmt.Errorf("%s", T("key_field_required"))
+	}
+	entry.ExpiresAt = strings.TrimSpace(m.editInputs[1].Value())
+	tokenLimit := strings.TrimSpace(m.editInputs[2].Value())
+	if entry.ExpiresAt != "" {
+		if _, err := time.Parse(time.RFC3339, entry.ExpiresAt); err != nil {
+			return entry, fmt.Errorf("%s", T("key_field_expiry_invalid"))
+		}
+	}
+	if tokenLimit != "" {
+		parsed, err := strconv.ParseInt(tokenLimit, 10, 64)
+		if err != nil || parsed < 0 {
+			return entry, fmt.Errorf("%s", T("key_field_token_invalid"))
+		}
+		entry.TokenLimit = parsed
+	}
+	return entry, nil
+}
+
+func formatAccessKeyEntry(entry accessAPIKeyEntry) string {
+	info := maskKey(entry.APIKey)
+	meta := make([]string, 0, 2)
+	if entry.ExpiresAt != "" {
+		meta = append(meta, "expires-at: "+entry.ExpiresAt)
+	}
+	if entry.TokenLimit > 0 {
+		meta = append(meta, fmt.Sprintf("token-limit: %d", entry.TokenLimit))
+	}
+	if len(meta) == 0 {
+		return info
+	}
+	return info + " (" + strings.Join(meta, ", ") + ")"
+}
+
+func (m *keysTabModel) focusEditField(idx int) {
+	if idx < 0 || idx >= len(m.editInputs) {
+		return
+	}
+	for i := range m.editInputs {
+		if i == idx {
+			m.editInputs[i].Focus()
+		} else {
+			m.editInputs[i].Blur()
+		}
+	}
+	m.editField = idx
+}
+
+func (m *keysTabModel) clearEditingState() {
+	m.editing = false
+	m.adding = false
+	m.editField = 0
+	m.editingError = ""
+	for i := range m.editInputs {
+		m.editInputs[i].Blur()
+	}
+}
+
+func (m keysTabModel) renderEditForm(sb *strings.Builder) {
+	modeLabel := T("new_key_prompt")
+	if m.editing {
+		modeLabel = T("edit_key_prompt")
+	}
+	sb.WriteString(helpStyle.Render(strings.TrimSpace(modeLabel)))
+	sb.WriteString("\n")
+	for i := range m.editInputs {
+		sb.WriteString(m.editInputs[i].View())
+		sb.WriteString("\n")
+	}
+	if m.editingError != "" {
+		sb.WriteString(errorStyle.Render("✗ " + m.editingError))
+		sb.WriteString("\n")
+	}
+	helpKey := "enter_add"
+	if m.editing {
+		helpKey = "enter_save_esc"
+	}
+	sb.WriteString(helpStyle.Render(T(helpKey)))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render(T("key_form_nav_hint")))
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render(T("key_entry_hint")))
+	sb.WriteString("\n")
 }
